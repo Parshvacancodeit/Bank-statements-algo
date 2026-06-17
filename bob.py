@@ -51,22 +51,22 @@ def detect_bank(pdf_path: str) -> str:
 
     # Check most-specific identifiers first to avoid false matches
     # HDFC: their own IFSC code or brand name (no spaces due to PDF extraction)
-    if 'hdfcbank' in text or 'hdfc0001' in text or 'hdfc bank' in text:
+    if re.search(r'\bhdfc\s*bank\b', text) or 'hdfcbank' in text or 'hdfc0001' in text:
         return 'hdfc'
     # BOB: bank of baroda or BARB IFSC prefix
-    if 'bank of baroda' in text or 'bankofbaroda' in text or 'barb0' in text:
+    if re.search(r'\bbank\s*of\s*baroda\b', text) or 'bankofbaroda' in text or 'barb0' in text:
         return 'bob'
     # Axis: own IFSC code UTIB0001 in header area, or 'axis bank'
-    if 'axis bank' in text or 'axis' in text or 'utib0001' in text:
+    if re.search(r'\baxis\s*bank\b', text) or 'axisbank' in text or 'utib0001' in text:
         return 'axis'
     # Kotak, ICICI, SBI, Indian Bank
-    if 'kotak' in text or 'kotak mahindra' in text:
+    if re.search(r'\bkotak\s+mahindra\b', text) or re.search(r'\bkotak\s*bank\b', text) or 'kkbk' in text:
         return 'kotak'
-    if 'icici' in text or 'icici bank' in text:
+    if re.search(r'\bicici\s*bank\b', text) or 'icicibank' in text or 'icici' in text:
         return 'icici'
-    if 'state bank of india' in text or 'sbi' in text:
+    if re.search(r'\bstate\s*bank\s*of\s*india\b', text) or 'sbin0' in text or re.search(r'\bsbi\b', text):
         return 'sbi'
-    if 'indian bank' in text or 'idib' in text:
+    if re.search(r'\bindian\s*bank\b', text) or 'idib' in text:
         return 'indian'
     return 'unknown'
 
@@ -331,6 +331,16 @@ BANK_COLORS = {
     'unknown': '404040',
 }
 
+PREFERRED_COLUMN_ORDER = [
+    'DATE', 'Date',
+    'DESCRIPTION', 'Description',
+    'TRANSACTION_NO', 'Chq No', 'Ref No',
+    'WITHDRAWAL_AMOUNT', 'Withdrawal', 'Debit',
+    'DEPOSIT_AMOUNT', 'Deposit', 'Credit',
+    'CLOSING_BALANCE', 'Balance',
+    'Value Date', 'Branch',
+]
+
 
 def _add_meta_sheet(wb, bank: str, pdf_path: str, record_count: int):
     ws = wb.create_sheet('Info', 0)
@@ -361,7 +371,26 @@ def _add_meta_sheet(wb, bank: str, pdf_path: str, record_count: int):
     ws.column_dimensions['B'].width = 36
 
 
-def write_excel(records: list[dict], headers: list[str], bank: str, pdf_path: str, out_path: str):
+def _build_dynamic_headers(records: list[dict]) -> list[str]:
+    seen = []
+    for rec in records:
+        for key in rec.keys():
+            if key.startswith('_'):
+                continue
+            if key not in seen:
+                seen.append(key)
+
+    ordered = []
+    for key in PREFERRED_COLUMN_ORDER:
+        if key in seen and key not in ordered:
+            ordered.append(key)
+    for key in seen:
+        if key not in ordered:
+            ordered.append(key)
+    return ordered
+
+
+def write_excel(records: list[dict], bank: str, pdf_path: str, out_path: str):
     wb = openpyxl.Workbook()
 
     # Create Transactions sheet first (as active), then Info sheet
@@ -370,6 +399,10 @@ def write_excel(records: list[dict], headers: list[str], bank: str, pdf_path: st
 
     _add_meta_sheet(wb, bank, pdf_path, len(records))
     ws.sheet_view.showGridLines = False
+
+    headers = _build_dynamic_headers(records)
+    if not headers:
+        headers = ['Date', 'Description', 'Chq No', 'Debit', 'Credit', 'Balance']
 
     color = BANK_COLORS.get(bank, '404040')
     header_fill = PatternFill('solid', start_color=color)
@@ -475,17 +508,43 @@ def process_pdf(pdf_path: str, out_dir: str = '.') -> str:
     bank = detect_bank(pdf_path)
     print(f"  Detected bank: {bank.upper()}")
 
-    extractor = EXTRACTORS.get(bank, extract_axis)
-    records   = extractor(pdf_path)
-    print(f"  Extracted {len(records)} transactions")
+    records = []
 
-    # If no records found with bank-specific extractor, try the universal extractor
-    if not records and _HAS_UNIVERSAL:
+    # Prefer the universal extractor because it supports all current PDFs
+    if _HAS_UNIVERSAL:
         try:
-            print("  → Trying universal extractor fallback...")
+            print("  → Trying universal extractor...")
             df, meta = ube_extract_statement(pdf_path)
             if df is not None and len(df) > 0:
                 # Map universal columns to our expected header names
+                mapped = []
+                for _, row in df.iterrows():
+                    mapped.append({
+                        'Date': str(row.get('DATE', '')),
+                        'Description': str(row.get('DESCRIPTION', '')),
+                        'Chq No': str(row.get('TRANSACTION_NO', '')),
+                        'Debit': str(row.get('WITHDRAWAL_AMOUNT', '')),
+                        'Credit': str(row.get('DEPOSIT_AMOUNT', '')),
+                        'Balance': str(row.get('CLOSING_BALANCE', '')),
+                    })
+                records = mapped
+                bank = (meta.get('bank') or 'unknown').lower()
+                print(f"  Universal extractor found {len(records)} transactions (bank: {bank})")
+        except Exception as e:
+            print(f"  ✗ Universal extractor failed: {e}")
+
+    # Fall back to bank-specific parser only if universal produced nothing
+    if not records:
+        extractor = EXTRACTORS.get(bank, extract_axis)
+        records = extractor(pdf_path)
+        print(f"  Bank-specific extractor found {len(records)} transactions")
+
+    # If universal extraction failed or returned nothing, try it one more time after bank-specific parsing
+    if not records and _HAS_UNIVERSAL:
+        try:
+            print("  → Retrying universal extractor fallback...")
+            df, meta = ube_extract_statement(pdf_path)
+            if df is not None and len(df) > 0:
                 mapped = []
                 for _, row in df.iterrows():
                     mapped.append({
@@ -506,11 +565,10 @@ def process_pdf(pdf_path: str, out_dir: str = '.') -> str:
         print("  ⚠ No transactions found — skipping Excel output.")
         return ''
 
-    headers  = BANK_HEADERS.get(bank, BANK_HEADERS['unknown'])
     stem     = Path(pdf_path).stem
     out_path = str(Path(out_dir) / f"{stem}_transactions.xlsx")
 
-    write_excel(records, headers, bank, pdf_path, out_path)
+    write_excel(records, bank, pdf_path, out_path)
     return out_path
 
 
