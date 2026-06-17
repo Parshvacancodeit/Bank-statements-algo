@@ -20,7 +20,7 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 # ==============================================================================
 # CONFIGURATION: Set this path to a directory containing PDF files,
 # or directly to a single PDF bank statement file.
-INPUT_PATH = "/Users/parshvapatel/Downloads/bank_statement_pdfs"
+INPUT_PATH = "/Users/parshvapatel/Downloads/bank_statement_pdfs/bankofbaroda.pdf"
 # ==============================================================================
 
 # Set up logging
@@ -108,38 +108,7 @@ def _classify_word(x0: float, column_ranges: dict[str, tuple[float, float]]) -> 
             return col_name
     return None
 
-def _validate_resolved_cols(table: list[list[str]], resolved_cols: dict[str, int]):
-    """Sanity check column contents to ensure values match expected formats."""
-    # Check DATE
-    if "DATE" in resolved_cols:
-        idx = resolved_cols["DATE"]
-        dates = [row[idx] for row in table if idx < len(row) and row[idx]]
-        valid_dates = [d for d in dates if _is_date(str(d))]
-        if dates and len(valid_dates) / len(dates) < 0.3:
-            logger.warning(f"Resolved DATE column at index {idx} has a low fraction of valid dates: {len(valid_dates)}/{len(dates)}")
-            
-    # Check amount columns for non-numeric content
-    for col_name in ["WITHDRAWAL_AMOUNT", "DEPOSIT_AMOUNT", "CLOSING_BALANCE"]:
-        if col_name in resolved_cols:
-            idx = resolved_cols[col_name]
-            vals = [row[idx] for row in table if idx < len(row) and row[idx]]
-            cleaned_vals = [_clean_amount(str(v)) for v in vals]
-            numeric_count = sum(1 for cv in cleaned_vals if cv != "")
-            # Count elements that are non-empty text (not dashes, not numbers)
-            non_empty_text_count = 0
-            for v in vals:
-                v_str = str(v).strip()
-                if v_str and not _clean_amount(v_str) and not _DASH_RE.match(v_str) and v_str.lower() != "null":
-                    non_empty_text_count += 1
-            if non_empty_text_count > numeric_count:
-                logger.warning(f"Resolved {col_name} column at index {idx} contains more text values ({non_empty_text_count}) than numeric values ({numeric_count})")
-
-def _assign_narrations(
-    transactions: list[dict],
-    narration_buffer: list[dict],
-    tolerance: float = 6.0,
-    prev_page_last_txn: dict | None = None,
-):
+def _assign_narrations(transactions: list[dict], narration_buffer: list[dict], tolerance: float = 6.0):
     """Assign buffered narration words to their correct transaction using visual grid preceding."""
     transactions.sort(key=lambda t: t["center"])
     for nword in narration_buffer:
@@ -154,13 +123,8 @@ def _assign_narrations(
         
         # Fallback to closest if slightly above the first transaction but close to it
         if target_txn is None and transactions:
-            if y < transactions[0]["center"] - tolerance:
-                if (transactions[0]["center"] - y) <= 25.0:
-                    target_txn = transactions[0]
-                elif prev_page_last_txn is not None:
-                    target_txn = prev_page_last_txn
-        elif target_txn is None and prev_page_last_txn is not None:
-            target_txn = prev_page_last_txn
+            if y < transactions[0]["center"] - tolerance and (transactions[0]["center"] - y) <= 25.0:
+                target_txn = transactions[0]
                 
         if target_txn is not None:
             existing = target_txn["DESCRIPTION"]
@@ -213,73 +177,27 @@ def process_axis(pdf_path: str) -> pd.DataFrame:
         "CLOSING_BALANCE": ["balance"],
     }
     
-    saved_resolved_cols = {}
-    saved_spans = {}
-    
     with pdfplumber.open(pdf_path) as pdf:
         for page_num, page in enumerate(pdf.pages, start=1):
-            tables = page.find_tables() or []
-            for table_obj in tables:
-                table = table_obj.extract()
+            tables = page.extract_tables() or []
+            for table in tables:
                 if not table or len(table[0]) < 4:
                     continue
                 
-                # Try to resolve columns from the first row
-                detected_cols = {}
-                for idx, cell in enumerate(table[0]):
+                # Check if this table has header row
+                header_row = table[0]
+                resolved_cols = {}
+                for idx, cell in enumerate(header_row):
                     val = _normalize_text(cell or "")
                     for canonical, aliases in col_mapping.items():
                         if any(alias in val for alias in aliases):
-                            detected_cols[canonical] = idx
+                            resolved_cols[canonical] = idx
                 
-                if len(detected_cols) >= 3:
-                    saved_resolved_cols = detected_cols
-                    start_idx = 1
-                    # Save the coordinate spans for each resolved canonical column
-                    saved_spans = {}
-                    for canonical, idx in detected_cols.items():
-                        if idx < len(table_obj.columns):
-                            col_obj = table_obj.columns[idx]
-                            saved_spans[canonical] = (col_obj.bbox[0], col_obj.bbox[2])
-                else:
-                    if saved_resolved_cols:
-                        start_idx = 0
-                        # Resolve columns using coordinate matching with saved spans
-                        resolved_cols = {}
-                        for canonical, saved_span in saved_spans.items():
-                            best_idx = None
-                            best_iou = -1.0
-                            for j, col_obj in enumerate(table_obj.columns):
-                                span_j = (col_obj.bbox[0], col_obj.bbox[2])
-                                inter = max(0.0, min(saved_span[1], span_j[1]) - max(saved_span[0], span_j[0]))
-                                union = (saved_span[1] - saved_span[0]) + (span_j[1] - span_j[0]) - inter
-                                iou = inter / union if union > 0 else 0.0
-                                if iou > best_iou:
-                                    best_iou = iou
-                                    best_idx = j
-                            
-                            # Fallback if no overlap
-                            if best_idx is None or best_iou == 0.0:
-                                best_dist = float('inf')
-                                for j, col_obj in enumerate(table_obj.columns):
-                                    span_j = (col_obj.bbox[0], col_obj.bbox[2])
-                                    center_saved = (saved_span[0] + saved_span[1]) / 2.0
-                                    center_j = (span_j[0] + span_j[1]) / 2.0
-                                    dist = abs(center_saved - center_j)
-                                    if dist < best_dist:
-                                        best_dist = dist
-                                        best_idx = j
-                            if best_idx is not None:
-                                resolved_cols[canonical] = best_idx
-                    else:
+                if len(resolved_cols) < 3:
+                    if not all_rows:
                         continue
                 
-                if len(detected_cols) >= 3:
-                    resolved_cols = saved_resolved_cols
-                
-                # Perform content validation
-                _validate_resolved_cols(table[start_idx:], resolved_cols)
-                
+                start_idx = 1
                 for row in table[start_idx:]:
                     if not row:
                         continue
@@ -319,7 +237,6 @@ def process_bob(pdf_path: str) -> pd.DataFrame:
     }
     
     all_transactions = []
-    prev_page_last_txn = None
     
     with pdfplumber.open(pdf_path) as pdf:
         for page_num, page in enumerate(pdf.pages, start=1):
@@ -386,11 +303,8 @@ def process_bob(pdf_path: str) -> pd.DataFrame:
                             page_narration_buffer.append({"text": w["text"], "center": line_center_y})
             
             # Proximity assign descriptions for this page
-            _assign_narrations(page_transactions, page_narration_buffer, tolerance=6.0, prev_page_last_txn=prev_page_last_txn)
+            _assign_narrations(page_transactions, page_narration_buffer, tolerance=6.0)
             all_transactions.extend(page_transactions)
-            
-            if page_transactions:
-                prev_page_last_txn = page_transactions[-1]
 
     # Filter transactions
     clean_txns = []
@@ -420,7 +334,6 @@ def process_hdfc(pdf_path: str) -> pd.DataFrame:
     }
     
     all_transactions = []
-    prev_page_last_txn = None
     
     with pdfplumber.open(pdf_path) as pdf:
         for page_num, page in enumerate(pdf.pages, start=1):
@@ -429,30 +342,18 @@ def process_hdfc(pdf_path: str) -> pd.DataFrame:
                 continue
             
             lines = _group_words_by_line(words)
-            
-            # Determine if page has a header row using keyword matching
-            has_header_row_on_page = False
-            for line in lines:
-                text_norm = _normalize_text(line["text"])
-                if "narration" in text_norm or "statement of account" in text_norm:
-                    has_header_row_on_page = True
-                    break
-            
-            page_header_passed = not has_header_row_on_page
+            table_started = False
             
             page_transactions = []
             page_narration_buffer = []
             
             for line in lines:
                 text_norm = _normalize_text(line["text"])
+                if "narration" in text_norm and "closing" in text_norm:
+                    table_started = True
+                    continue
                 
-                # Check for footer and stop processing page
-                if any(f in text_norm for f in ["closing balance includes", "contents of this", "registered office", "state account branch"]):
-                    break
-                    
-                if not page_header_passed:
-                    if "narration" in text_norm or "statement of account" in text_norm:
-                        page_header_passed = True
+                if not table_started:
                     continue
                 
                 date_text = None
@@ -499,11 +400,8 @@ def process_hdfc(pdf_path: str) -> pd.DataFrame:
                             page_narration_buffer.append({"text": w["text"], "center": line_center_y})
             
             # Proximity assign descriptions for this page
-            _assign_narrations(page_transactions, page_narration_buffer, tolerance=6.0, prev_page_last_txn=prev_page_last_txn)
+            _assign_narrations(page_transactions, page_narration_buffer, tolerance=6.0)
             all_transactions.extend(page_transactions)
-            
-            if page_transactions:
-                prev_page_last_txn = page_transactions[-1]
 
     clean_txns = []
     for t in all_transactions:
@@ -531,7 +429,6 @@ def process_icici(pdf_path: str) -> pd.DataFrame:
     }
     
     all_transactions = []
-    prev_page_last_txn = None
     
     with pdfplumber.open(pdf_path) as pdf:
         for page_num, page in enumerate(pdf.pages, start=1):
@@ -596,11 +493,8 @@ def process_icici(pdf_path: str) -> pd.DataFrame:
                             page_narration_buffer.append({"text": w["text"], "center": line_center_y})
             
             # Proximity assign descriptions for this page
-            _assign_narrations(page_transactions, page_narration_buffer, tolerance=6.0, prev_page_last_txn=prev_page_last_txn)
+            _assign_narrations(page_transactions, page_narration_buffer, tolerance=6.0)
             all_transactions.extend(page_transactions)
-            
-            if page_transactions:
-                prev_page_last_txn = page_transactions[-1]
 
     clean_txns = []
     for t in all_transactions:
@@ -867,7 +761,6 @@ def process_indian_bank(pdf_path: str) -> pd.DataFrame:
     }
     
     all_transactions = []
-    prev_page_last_txn = None
     
     with pdfplumber.open(pdf_path) as pdf:
         for page_num, page in enumerate(pdf.pages, start=1):
@@ -934,11 +827,8 @@ def process_indian_bank(pdf_path: str) -> pd.DataFrame:
                             page_narration_buffer.append({"text": w["text"], "center": line_center_y})
             
             # Proximity assign descriptions for this page
-            _assign_narrations(page_transactions, page_narration_buffer, tolerance=6.0, prev_page_last_txn=prev_page_last_txn)
+            _assign_narrations(page_transactions, page_narration_buffer, tolerance=6.0)
             all_transactions.extend(page_transactions)
-            
-            if page_transactions:
-                prev_page_last_txn = page_transactions[-1]
 
     clean_txns = []
     for t in all_transactions:
